@@ -1,0 +1,171 @@
+# 独立 GitHub Actions 工作流：无需 Fork FlowDown
+# 放置于独立仓库的 .github/workflows/build-ollama-timeout.yml
+name: Build FlowDown - Ollama Custom
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_seconds:
+        description: "Ollama timeout in seconds"
+        required: true
+        default: "3600"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos:
+    name: Build FlowDown macOS
+    runs-on: macos-26
+    timeout-minutes: 360
+
+    steps:
+      # 每次运行直接拉取官方仓库
+      - name: Checkout upstream FlowDown
+        uses: actions/checkout@v4
+        with:
+          repository: Lakr233/FlowDown
+          ref: main
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Validate and patch Ollama timeout
+        env:
+          TIMEOUT: ${{ inputs.timeout_seconds }}
+        run: |
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+
+          value = os.environ['TIMEOUT']
+          if not value.isdecimal() or int(value) < 60:
+              raise SystemExit('ERROR: timeout_seconds must be an integer >= 60')
+
+          path = Path('Frameworks/ChatClientKit/Sources/ServerEvent/EventSource.swift')
+          if not path.is_file():
+              raise SystemExit(f'ERROR: file not found: {path}')
+
+          text = path.read_text()
+          old = 'timeoutInterval: TimeInterval = 300'
+          count = text.count(old)
+          if count == 0:
+              raise SystemExit('ERROR: upstream timeout definition changed; please review the patch')
+          path.write_text(text.replace(old, f'timeoutInterval: TimeInterval = {value}'))
+          print(f'Changed {count} timeout definition(s) to {value}s')
+          PY
+
+      # Ad-hoc 签名不具备 CloudKit 正式授权，禁用真正的 CloudKit
+      - name: Disable CloudKit for local build
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('FlowDown/Application/AppEnvironment.swift')
+          if not path.is_file():
+              raise SystemExit(f'ERROR: file not found: {path}')
+          text = path.read_text()
+          old = 'let shouldEnableCloudSync = SyncEngine.isCloudSyncSupported'
+          if text.count(old) != 1:
+              raise SystemExit('ERROR: upstream CloudKit setting changed; please review the patch')
+          path.write_text(text.replace(old, 'let shouldEnableCloudSync = false // local ad-hoc build', 1))
+          print('CloudKit disabled')
+          PY
+
+      - name: Select Xcode and resolve Swift packages
+        run: |
+          set -euo pipefail
+          chmod +x Resources/DevKit/scripts/select_newest_xcode.sh
+          ./Resources/DevKit/scripts/select_newest_xcode.sh
+          xcodebuild -version
+          xcodebuild -downloadComponent MetalToolchain
+          xcodebuild \
+            -workspace FlowDown.xcworkspace \
+            -scheme FlowDown \
+            -resolvePackageDependencies \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Archive macOS app
+        run: |
+          set -euo pipefail
+          mkdir -p BuildArtifacts
+          xcodebuild \
+            -workspace FlowDown.xcworkspace \
+            -scheme FlowDown \
+            -configuration Release \
+            -destination 'generic/platform=macOS,variant=Mac Catalyst' \
+            archive \
+            -archivePath BuildArtifacts/macos.xcarchive \
+            -resultBundlePath BuildArtifacts/macos.xcresult \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) TEST_SIMULATOR_DISABLE_CLOUD_KIT'
+
+      - name: Ad-hoc sign and verify Sandbox
+        run: |
+          set -euo pipefail
+          APP="BuildArtifacts/macos.xcarchive/Products/Applications/FlowDown.app"
+          ENT="BuildArtifacts/FlowDown-local.entitlements"
+          FINAL="BuildArtifacts/final-entitlements.plist"
+          test -d "$APP" || { echo 'ERROR: FlowDown.app missing'; exit 1; }
+          cat > "$ENT" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>com.apple.security.app-sandbox</key>
+              <true/>
+              <key>com.apple.security.network.client</key>
+              <true/>
+              <key>com.apple.security.files.user-selected.read-write</key>
+              <true/>
+              <key>com.apple.security.device.audio-input</key>
+              <true/>
+              <key>com.apple.security.personal-information.calendars</key>
+              <true/>
+              <key>com.apple.security.personal-information.photos-library</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+          plutil -lint "$ENT"
+          codesign --force --deep --sign - "$APP"
+          codesign --force --sign - --entitlements "$ENT" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -d --entitlements :- "$APP" > "$FINAL" 2>/dev/null
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.app-sandbox' "$FINAL")" = true
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.network.client' "$FINAL")" = true
+
+      - name: Package application and archive
+        env:
+          TIMEOUT: ${{ inputs.timeout_seconds }}
+        run: |
+          set -euo pipefail
+          ditto -c -k --sequesterRsrc --keepParent \
+            BuildArtifacts/macos.xcarchive/Products/Applications/FlowDown.app \
+            "BuildArtifacts/FlowDown-Ollama-${TIMEOUT}s.app.zip"
+          ditto -c -k --sequesterRsrc --keepParent \
+            BuildArtifacts/macos.xcarchive \
+            "BuildArtifacts/FlowDown-Ollama-${TIMEOUT}s.xcarchive.zip"
+          ls -lh BuildArtifacts/*.zip
+
+      - name: Upload FlowDown.app
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlowDown-macOS-Ollama-${{ inputs.timeout_seconds }}s
+          path: |
+            BuildArtifacts/FlowDown-Ollama-${{ inputs.timeout_seconds }}s.app.zip
+            BuildArtifacts/final-entitlements.plist
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload xcarchive
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlowDown-xcarchive-${{ inputs.timeout_seconds }}s
+          path: BuildArtifacts/FlowDown-Ollama-${{ inputs.timeout_seconds }}s.xcarchive.zip
+          if-no-files-found: error
+          retention-days: 7
