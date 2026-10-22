@@ -59,16 +59,27 @@ jobs:
       - name: Disable CloudKit for local build
         run: |
           python3 <<'PY'
+          import re
           from pathlib import Path
 
           path = Path('FlowDown/Application/AppEnvironment.swift')
           if not path.is_file():
               raise SystemExit(f'ERROR: file not found: {path}')
           text = path.read_text()
-          old = 'let shouldEnableCloudSync = SyncEngine.isCloudSyncSupported'
-          if text.count(old) != 1:
+          # 替换完整函数调用，包含跨行参数和右括号，避免遗留无效 Swift 代码。
+          pattern = (
+              r'(?m)^([ \t]*)let shouldEnableCloudSync\s*=\s*'
+              r'SyncEngine\.isCloudSyncSupported\s*\(\s*'
+              r'containerIdentifier:\s*CloudKitConfig\.containerIdentifier\s*,?\s*\)'
+          )
+          patched, count = re.subn(
+              pattern,
+              lambda match: match[1] + 'let shouldEnableCloudSync = false // local ad-hoc build',
+              text,
+          )
+          if count != 1:
               raise SystemExit('ERROR: upstream CloudKit setting changed; please review the patch')
-          path.write_text(text.replace(old, 'let shouldEnableCloudSync = false // local ad-hoc build', 1))
+          path.write_text(patched)
           print('CloudKit disabled')
           PY
 
@@ -78,6 +89,8 @@ jobs:
           chmod +x Resources/DevKit/scripts/select_newest_xcode.sh
           ./Resources/DevKit/scripts/select_newest_xcode.sh
           xcodebuild -version
+          # 在下载工具链和解析依赖前，先验证修改后的 Swift 文件语法。
+          xcrun swiftc -frontend -parse FlowDown/Application/AppEnvironment.swift
           xcodebuild -downloadComponent MetalToolchain
           xcodebuild \
             -workspace FlowDown.xcworkspace \
